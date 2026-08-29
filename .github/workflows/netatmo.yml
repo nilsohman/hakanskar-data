@@ -87,9 +87,13 @@ jobs:
                                 })
               r.raise_for_status()
               for entry in r.json()['body']:
-                  day = datetime.fromtimestamp(entry['beg_time'], tz=timezone.utc).strftime('%Y-%m-%d')
-                  mm = entry['value'][0][0] if entry.get('value') and entry['value'][0] else 0
-                  rain_30d.append({'date': day, 'mm': round(mm, 1)})
+                  beg = entry['beg_time']
+                  step = entry.get('step_time') or 86400
+                  for i, v in enumerate(entry.get('value', [])):
+                      day_ts = beg + i * step
+                      day = datetime.fromtimestamp(day_ts, tz=timezone.utc).strftime('%Y-%m-%d')
+                      mm = v[0] if v and v[0] is not None else 0
+                      rain_30d.append({'date': day, 'mm': round(mm, 1)})
               rain_30d = rain_30d[-30:]
 
           # ---- 4. Skriv resultatet till en publik JSON-fil ----
