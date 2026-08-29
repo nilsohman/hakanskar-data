@@ -1,0 +1,137 @@
+name: Fetch Netatmo data
+
+on:
+  schedule:
+    - cron: '15 * * * *'   # varje timme, kl xx:15
+  workflow_dispatch: {}     # gör att du kan köra den manuellt från GitHub-fliken "Actions"
+
+permissions:
+  contents: write   # så jobbet får skriva/pusha den nya JSON-filen
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Installera beroenden
+        run: pip install requests pynacl
+
+      - name: Hämta Netatmo-data och skriv JSON
+        env:
+          NETATMO_CLIENT_ID: ${{ secrets.NETATMO_CLIENT_ID }}
+          NETATMO_CLIENT_SECRET: ${{ secrets.NETATMO_CLIENT_SECRET }}
+          NETATMO_REFRESH_TOKEN: ${{ secrets.NETATMO_REFRESH_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GITHUB_REPO: ${{ github.repository }}
+        run: |
+          python3 << 'PYEOF'
+          import os, json, time, base64
+          import requests
+          from datetime import datetime, timezone
+
+          CLIENT_ID = os.environ['NETATMO_CLIENT_ID']
+          CLIENT_SECRET = os.environ['NETATMO_CLIENT_SECRET']
+          REFRESH_TOKEN = os.environ['NETATMO_REFRESH_TOKEN']
+
+          # ---- 1. Förnya access-token (och få en NY refresh-token) ----
+          r = requests.post('https://api.netatmo.com/oauth2/token', data={
+              'grant_type': 'refresh_token',
+              'refresh_token': REFRESH_TOKEN,
+              'client_id': CLIENT_ID,
+              'client_secret': CLIENT_SECRET,
+          })
+          r.raise_for_status()
+          tokens = r.json()
+          access_token = tokens['access_token']
+          new_refresh_token = tokens['refresh_token']
+
+          # ---- 2. Hämta stationsdata (aktuella temperaturer + enhets-ID) ----
+          r = requests.get('https://api.netatmo.com/api/getstationsdata',
+                            headers={'Authorization': f'Bearer {access_token}'})
+          r.raise_for_status()
+          station = r.json()['body']['devices'][0]
+
+          device_id = station['_id']
+          indoor_temp = station['dashboard_data']['Temperature']
+          indoor_time = station['dashboard_data']['time_utc']
+
+          outdoor_temp = None
+          outdoor_time = None
+          rain_module_id = None
+          for module in station.get('modules', []):
+              if module['type'] == 'NAModule1':      # utemodul
+                  outdoor_temp = module['dashboard_data']['Temperature']
+                  outdoor_time = module['dashboard_data']['time_utc']
+              elif module['type'] == 'NAModule3':    # regnmätare
+                  rain_module_id = module['_id']
+
+          # ---- 3. Hämta regnmängd, senaste 30 dygnen ----
+          rain_30d = []
+          if rain_module_id:
+              date_end = int(time.time())
+              date_begin = date_end - 31 * 24 * 3600
+              r = requests.get('https://api.netatmo.com/api/getmeasure',
+                                headers={'Authorization': f'Bearer {access_token}'},
+                                params={
+                                    'device_id': device_id,
+                                    'module_id': rain_module_id,
+                                    'scale': '1day',
+                                    'type': 'sum_rain',
+                                    'date_begin': date_begin,
+                                    'date_end': date_end,
+                                })
+              r.raise_for_status()
+              for entry in r.json()['body']:
+                  day = datetime.fromtimestamp(entry['beg_time'], tz=timezone.utc).strftime('%Y-%m-%d')
+                  mm = entry['value'][0][0] if entry.get('value') and entry['value'][0] else 0
+                  rain_30d.append({'date': day, 'mm': round(mm, 1)})
+              rain_30d = rain_30d[-30:]
+
+          # ---- 4. Skriv resultatet till en publik JSON-fil ----
+          output = {
+              'updated': datetime.now(timezone.utc).isoformat(),
+              'indoor_temp': indoor_temp,
+              'indoor_time': indoor_time,
+              'outdoor_temp': outdoor_temp,
+              'outdoor_time': outdoor_time,
+              'rain_30d': rain_30d,
+          }
+          os.makedirs('docs', exist_ok=True)
+          with open('docs/netatmo-data.json', 'w') as f:
+              json.dump(output, f, ensure_ascii=False, indent=2)
+          print('Skrev docs/netatmo-data.json')
+
+          # ---- 5. Om refresh-token bytts ut: spara den nya som secret ----
+          if new_refresh_token != REFRESH_TOKEN:
+              gh_pat = os.environ.get('GH_PAT')
+              repo = os.environ['GITHUB_REPO']
+              if not gh_pat:
+                  raise SystemExit('VARNING: refresh-token ändrades men GH_PAT saknas - kan inte spara den nya token!')
+              import nacl.public, nacl.encoding
+              key_resp = requests.get(
+                  f'https://api.github.com/repos/{repo}/actions/secrets/public-key',
+                  headers={'Authorization': f'Bearer {gh_pat}', 'Accept': 'application/vnd.github+json'})
+              key_resp.raise_for_status()
+              key_data = key_resp.json()
+              public_key = nacl.public.PublicKey(key_data['key'].encode('utf-8'), nacl.encoding.Base64Encoder())
+              encrypted = nacl.public.SealedBox(public_key).encrypt(new_refresh_token.encode('utf-8'))
+              put_resp = requests.put(
+                  f'https://api.github.com/repos/{repo}/actions/secrets/NETATMO_REFRESH_TOKEN',
+                  headers={'Authorization': f'Bearer {gh_pat}', 'Accept': 'application/vnd.github+json'},
+                  json={'encrypted_value': base64.b64encode(encrypted).decode('utf-8'), 'key_id': key_data['key_id']})
+              put_resp.raise_for_status()
+              print('Ny refresh-token sparad som secret.')
+          PYEOF
+
+      - name: Checka in ny data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/netatmo-data.json
+          git diff --staged --quiet || git commit -m "Uppdatera Netatmo-data"
+          git push
