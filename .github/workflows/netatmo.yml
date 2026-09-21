@@ -36,6 +36,7 @@ jobs:
           python3 << 'PYEOF'
           import os, json, time, base64
           import requests
+          import nacl.public, nacl.encoding
           from datetime import datetime, timezone
 
           CLIENT_ID = os.environ['NETATMO_CLIENT_ID']
@@ -43,41 +44,12 @@ jobs:
           REFRESH_TOKEN = os.environ['NETATMO_REFRESH_TOKEN']
           GH_PAT = os.environ.get('GH_PAT')
           REPO = os.environ['GITHUB_REPO']
+          GH_HEADERS = {'Authorization': f'Bearer {GH_PAT}',
+                        'Accept': 'application/vnd.github+json'}
 
 
-          def save_refresh_token(value):
-              """Sparar ny refresh-token som GitHub-secret."""
-              if not GH_PAT:
-                  print('FEL: GH_PAT saknas - kan inte spara den nya refresh-token.')
-                  raise SystemExit(1)
-              import nacl.public, nacl.encoding
-              h = {'Authorization': f'Bearer {GH_PAT}',
-                   'Accept': 'application/vnd.github+json'}
-              kr = requests.get(
-                  f'https://api.github.com/repos/{REPO}/actions/secrets/public-key',
-                  headers=h)
-              if kr.status_code != 200:
-                  print(f'FEL: kunde inte hamta GitHubs publika nyckel ({kr.status_code}).')
-                  print('--> Har din GH_PAT gatt ut, eller saknar den behorigheten '
-                        'Secrets: Read and write? Svar:', kr.text[:300])
-                  raise SystemExit(1)
-              kd = kr.json()
-              pk = nacl.public.PublicKey(kd['key'].encode(), nacl.encoding.Base64Encoder())
-              enc = nacl.public.SealedBox(pk).encrypt(value.encode())
-              pr = requests.put(
-                  f'https://api.github.com/repos/{REPO}/actions/secrets/NETATMO_REFRESH_TOKEN',
-                  headers=h,
-                  json={'encrypted_value': base64.b64encode(enc).decode(),
-                        'key_id': kd['key_id']})
-              if pr.status_code not in (201, 204):
-                  print(f'FEL: kunde inte spara ny refresh-token ({pr.status_code}).',
-                        pr.text[:300])
-                  raise SystemExit(1)
-              print('Ny refresh-token sparad som secret.')
-
-
-          def netatmo_request(method, url, **kwargs):
-              """Anropar Netatmo med omforsok vid tillfalliga fel (5xx, timeout, 429)."""
+          def request_with_retry(method, url, **kwargs):
+              """HTTP-anrop med omforsok vid tillfalliga fel (5xx, 429, natverk)."""
               last = None
               for attempt in range(4):
                   try:
@@ -91,12 +63,45 @@ jobs:
                       wait = 5 * (attempt + 1)
                       print(f'Tillfalligt fel ({last}) - forsoker igen om {wait}s...')
                       time.sleep(wait)
-              print('FEL: Netatmo svarade inte efter flera forsok.', last)
+              print('FEL: inget svar efter flera forsok:', url, last)
               raise SystemExit(1)
 
 
+          # ---- 0. Kontrollera att GH_PAT fungerar INNAN Netatmo-token rors ----
+          # Har GH_PAT gatt ut avbryts korningen har, medan Netatmo-token
+          # fortfarande ar oanvand och giltig. Da racker det att fornya GH_PAT.
+          if not GH_PAT:
+              print('FEL: secreten GH_PAT saknas.')
+              raise SystemExit(1)
+          kr = request_with_retry('GET',
+              f'https://api.github.com/repos/{REPO}/actions/secrets/public-key',
+              headers=GH_HEADERS)
+          if kr.status_code != 200:
+              print(f'FEL: GH_PAT fungerar inte ({kr.status_code}): {kr.text[:300]}')
+              print('--> Har den gatt ut? Fornya den och uppdatera secreten GH_PAT.')
+              print('--> Netatmo-token har INTE rorts, sa inget annat behover goras.')
+              raise SystemExit(1)
+          GH_KEY = kr.json()
+
+
+          def save_refresh_token(value):
+              """Sparar ny refresh-token som GitHub-secret."""
+              pk = nacl.public.PublicKey(GH_KEY['key'].encode(), nacl.encoding.Base64Encoder())
+              enc = nacl.public.SealedBox(pk).encrypt(value.encode())
+              pr = request_with_retry('PUT',
+                  f'https://api.github.com/repos/{REPO}/actions/secrets/NETATMO_REFRESH_TOKEN',
+                  headers=GH_HEADERS,
+                  json={'encrypted_value': base64.b64encode(enc).decode(),
+                        'key_id': GH_KEY['key_id']})
+              if pr.status_code not in (201, 204):
+                  print(f'FEL: kunde inte spara ny refresh-token ({pr.status_code}).',
+                        pr.text[:300])
+                  raise SystemExit(1)
+              print('Ny refresh-token sparad som secret.')
+
+
           # ---- 1. Förnya access-token (Netatmo ger samtidigt en NY refresh-token) ----
-          r = netatmo_request('POST', 'https://api.netatmo.com/oauth2/token', data={
+          r = request_with_retry('POST', 'https://api.netatmo.com/oauth2/token', data={
               'grant_type': 'refresh_token',
               'refresh_token': REFRESH_TOKEN,
               'client_id': CLIENT_ID,
@@ -115,14 +120,14 @@ jobs:
           new_refresh_token = tokens.get('refresh_token', REFRESH_TOKEN)
 
           # ---- 2. Spara den nya refresh-token DIREKT ----
-          # Detta MASTE ske innan nagot annat kan misslyckas: Netatmo har redan
-          # ogiltigforklarat den gamla, sa tappar vi den nya har kedjan brustit.
+          # Maste ske innan nagot annat kan misslyckas: Netatmo har redan
+          # ogiltigforklarat den gamla.
           if new_refresh_token != REFRESH_TOKEN:
               save_refresh_token(new_refresh_token)
 
           # ---- 3. Hämta stationsdata (aktuella temperaturer + enhets-ID) ----
-          r = netatmo_request('GET', 'https://api.netatmo.com/api/getstationsdata',
-                            headers={'Authorization': f'Bearer {access_token}'})
+          r = request_with_retry('GET', 'https://api.netatmo.com/api/getstationsdata',
+                                 headers={'Authorization': f'Bearer {access_token}'})
           if r.status_code != 200:
               print('FEL vid getstationsdata:', r.status_code, r.text[:500])
               raise SystemExit(1)
@@ -148,16 +153,16 @@ jobs:
           if rain_module_id:
               date_end = int(time.time())
               date_begin = date_end - 31 * 24 * 3600
-              r = netatmo_request('GET', 'https://api.netatmo.com/api/getmeasure',
-                                headers={'Authorization': f'Bearer {access_token}'},
-                                params={
-                                    'device_id': device_id,
-                                    'module_id': rain_module_id,
-                                    'scale': '1day',
-                                    'type': 'sum_rain',
-                                    'date_begin': date_begin,
-                                    'date_end': date_end,
-                                })
+              r = request_with_retry('GET', 'https://api.netatmo.com/api/getmeasure',
+                                     headers={'Authorization': f'Bearer {access_token}'},
+                                     params={
+                                         'device_id': device_id,
+                                         'module_id': rain_module_id,
+                                         'scale': '1day',
+                                         'type': 'sum_rain',
+                                         'date_begin': date_begin,
+                                         'date_end': date_end,
+                                     })
               if r.status_code != 200:
                   print('FEL vid getmeasure:', r.status_code, r.text[:500])
                   raise SystemExit(1)
