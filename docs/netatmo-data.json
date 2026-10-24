@@ -1,9 +1,9 @@
 {
-  "updated": "2026-10-23T22:05:21.522657+00:00",
-  "indoor_temp": 11.9,
-  "indoor_time": 1792792913,
-  "outdoor_temp": 8,
-  "outdoor_time": 1792792878,
+  "updated": "2026-10-24T00:37:17.008334+00:00",
+  "indoor_temp": 11.7,
+  "indoor_time": 1792801998,
+  "outdoor_temp": 8.2,
+  "outdoor_time": 1792801950,
   "rain_30d": [
     {
       "date": "2026-09-25",
